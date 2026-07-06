@@ -1,0 +1,225 @@
+# Approval Service — ручное тестирование
+# Запустите сервис: docker compose up --build
+# Базовый URL: http://localhost:8000
+#
+# Заголовки авторизации обязательны для всех запросов кроме /health и /ready:
+#   X-User-Id: идентификатор пользователя
+#   X-Permissions: список прав через запятую
+#
+# После создания заявки скопируйте "id" из ответа и замените REQUEST_ID ниже.
+
+
+# ------------------------------------------------------------------
+# 1. Проверка живости
+# ------------------------------------------------------------------
+
+curl http://localhost:8000/health
+
+# Ожидаемый ответ:
+# {"status":"ok"}
+
+
+# ------------------------------------------------------------------
+# 2. Проверка готовности (включает проверку соединения с БД)
+# ------------------------------------------------------------------
+
+curl http://localhost:8000/ready
+
+# Ожидаемый ответ:
+# {"status":"ready"}
+
+
+# ------------------------------------------------------------------
+# 3. Создать заявку на согласование
+# ------------------------------------------------------------------
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:create" \
+  -d '{
+    "sourceType": "publication",
+    "sourceId": "pub_123",
+    "title": "Instagram reel draft",
+    "description": "Needs final approval",
+    "reviewerUserIds": ["usr_2", "usr_3"]
+  }' | python3 -m json.tool
+
+# Ожидаемый ответ: 201, статус "pending", поле "id" — скопируйте его
+
+
+# ------------------------------------------------------------------
+# 4. Создать заявку с idempotency-key (повтор вернёт ту же запись)
+# ------------------------------------------------------------------
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:create" \
+  -H "Idempotency-Key: unique-key-001" \
+  -d '{
+    "sourceType": "scenario",
+    "sourceId": "scn_456",
+    "title": "Holiday campaign scenario",
+    "reviewerUserIds": ["usr_2"]
+  }' | python3 -m json.tool
+
+# Повторный запрос с тем же Idempotency-Key вернёт 200 с тем же id:
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:create" \
+  -H "Idempotency-Key: unique-key-001" \
+  -d '{
+    "sourceType": "scenario",
+    "sourceId": "scn_456",
+    "title": "Holiday campaign scenario",
+    "reviewerUserIds": ["usr_2"]
+  }' | python3 -m json.tool
+
+
+# ------------------------------------------------------------------
+# 5. Получить список заявок в workspace
+# ------------------------------------------------------------------
+
+curl -s http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:read" | python3 -m json.tool
+
+# Ожидаемый ответ: массив всех заявок в ws_1
+
+
+# ------------------------------------------------------------------
+# 6. Изоляция workspace — другой workspace возвращает пустой список
+# ------------------------------------------------------------------
+
+curl -s http://localhost:8000/api/v1/workspaces/ws_OTHER/approval-requests \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:read" | python3 -m json.tool
+
+# Ожидаемый ответ: []
+
+
+# ------------------------------------------------------------------
+# 7. Получить одну заявку по id
+#    Замените REQUEST_ID на реальный id из шага 3
+# ------------------------------------------------------------------
+
+REQUEST_ID="замените-на-реальный-id"
+
+curl -s http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/$REQUEST_ID \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:read" | python3 -m json.tool
+
+# Ожидаемый ответ: объект заявки со статусом "pending"
+
+
+# ------------------------------------------------------------------
+# 8. Согласовать заявку (approve)
+# ------------------------------------------------------------------
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/$REQUEST_ID/approve \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_2" \
+  -H "X-Permissions: approval:decide" \
+  -d '{"comment": "Выглядит хорошо, одобряю"}' | python3 -m json.tool
+
+# Ожидаемый ответ: статус "approved", поле "decision" заполнено
+
+
+# ------------------------------------------------------------------
+# 9. Попытка повторного решения — защита от двойного decide (409)
+# ------------------------------------------------------------------
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/$REQUEST_ID/reject \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_2" \
+  -H "X-Permissions: approval:decide" \
+  -d '{"reason": "Передумал"}' | python3 -m json.tool
+
+# Ожидаемый ответ: 409 Conflict
+
+
+# ------------------------------------------------------------------
+# 10. Отклонить новую заявку (reject)
+#     Сначала создайте новую заявку и возьмите её id
+# ------------------------------------------------------------------
+
+NEW_ID=$(curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:create" \
+  -d '{
+    "sourceType": "edit",
+    "sourceId": "edt_789",
+    "title": "Footer redesign",
+    "reviewerUserIds": ["usr_3"]
+  }' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+echo "Новая заявка: $NEW_ID"
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/$NEW_ID/reject \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_3" \
+  -H "X-Permissions: approval:decide" \
+  -d '{"reason": "Не соответствует брендбуку"}' | python3 -m json.tool
+
+# Ожидаемый ответ: статус "rejected"
+
+
+# ------------------------------------------------------------------
+# 11. Отменить заявку (cancel)
+# ------------------------------------------------------------------
+
+CANCEL_ID=$(curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:create" \
+  -d '{
+    "sourceType": "external",
+    "sourceId": "ext_000",
+    "title": "Внешний баннер",
+    "reviewerUserIds": ["usr_2"]
+  }' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+echo "Заявка для отмены: $CANCEL_ID"
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests/$CANCEL_ID/cancel \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:cancel" \
+  -d '{"reason": "Черновик удалён"}' | python3 -m json.tool
+
+# Ожидаемый ответ: статус "cancelled"
+
+
+# ------------------------------------------------------------------
+# 12. Проверка прав — нет нужного права (403)
+# ------------------------------------------------------------------
+
+curl -s -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: usr_1" \
+  -H "X-Permissions: approval:read" \
+  -d '{
+    "sourceType": "publication",
+    "sourceId": "pub_999",
+    "title": "Без прав",
+    "reviewerUserIds": ["usr_2"]
+  }' | python3 -m json.tool
+
+# Ожидаемый ответ: 403 Forbidden
+
+
+# ------------------------------------------------------------------
+# Проверка БД напрямую (пока контейнер запущен)
+# ------------------------------------------------------------------
+
+# Список всех заявок:
+docker exec approval-service-db-1 psql -U $POSTGRES_USER -d $POSTGRES_DB \
+  -c "SELECT id, title, status, created_by, created_at FROM approval_requests ORDER BY created_at;"
+
+# Все решения:
+docker exec approval-service-db-1 psql -U $POSTGRES_USER -d $POSTGRES_DB \
+  -c "SELECT r.title, d.action, d.actor_user_id, d.comment, d.reason, d.created_at FROM approval_decisions d JOIN approval_requests r ON r.id = d.request_id ORDER BY d.created_at;"

@@ -223,3 +223,6 @@ __marimo__/
 
 CLAUDE.md
 crm_system_venv/
+appr_service/
+*.db
+*.db-journal
